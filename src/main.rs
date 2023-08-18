@@ -1,62 +1,60 @@
+mod contexts;
+mod file;
+mod model;
+
+use clap::Parser;
 use futures::StreamExt;
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
 use serde_json;
-use std::{env, error::Error};
+use std::io;
+use std::{env, error::Error, io::Write};
 use tokio;
 
-#[derive(Deserialize, Serialize, Debug)]
-struct StreamMsg {
-    id: String,
-    model: String,
-    choices: Vec<StreamMsgChoice>,
-}
+use crate::{
+    contexts::{ABREVIATE, CODE, DND, SHORT},
+    file::{append_data, append_log, load_data},
+    model::{ChatCompletion, Msg, Obj, StreamMsg},
+};
 
-#[derive(Deserialize, Serialize, Debug)]
-struct StreamMsgChoiceDelta {
-    content: Option<String>,
-}
-
-#[derive(Deserialize, Serialize, Debug)]
-struct StreamMsgChoice {
-    delta: StreamMsgChoiceDelta,
-    index: u32,
-    finish_reason: Option<String>,
-}
-
-#[derive(Deserialize, Serialize, Debug)]
-struct Msg {
-    role: String,
-    content: String,
-}
-#[derive(Deserialize, Serialize, Debug)]
-struct Obj {
-    model: String,
-    messages: Vec<Msg>,
-    stream: bool,
-}
-
-async fn post(context: &str, message: String) -> Result<String, Box<dyn Error>> {
+async fn prompt(context: &str, message: &String, history: &Vec<String>) -> Result<String, Box<dyn Error>> {
     let client = Client::new();
 
-    let data = r#"
-   {
-    "model": "gpt-4",
-    "stream": true,
-    "messages": [{"role": "system", "content": "always answer in rhyme"},{"role": "user", "content": "Hello!"}]
-   }"#;
 
-    let message = Msg {
-        role: "system".to_string(),
-        content: message,
+    let user_message = Msg {
+        role: "user".to_string(),
+        content: message.clone(),
     };
-    let data_package = Obj{ model:"gpt-4".to_string(), stream: true, messages:vec!(
-            Msg{ role: "system".to_string(), content: match context {
-                "dnd" => "You are an assistant to a DM and you help him make a great epic fantasy setting d&d campaign. Use full dnd statblocks and CR for characters. Full item descriptions like d&d rules for items. Always use elequent prose and try to add multiple senses to descriptions of scenarios and scenes." ,
-                "code" => "You are an assistant coder. Prefered languges are in order: Rust, typescript, c#, python. Prefered frameworks: solid.js, tailwind, svelte, react, preact, angular. answer with code blocks and limited prose. I don't like to read text but I can scan code quickly",
-                _ => "There is no prior context. Be your awesome you!",
-                }.to_string()
-            }, message)};
+
+    let mut messages: Vec<Msg> = history
+        .iter()
+        .map(|h| Msg {
+            role: "assistant".to_string(),
+            content: h.clone(),
+        })
+        .collect();
+
+    messages.push(Msg {
+        role: "system".to_string(),
+        content: match context {
+            "dnd" => DND,
+            "code" => CODE,
+            "short" => SHORT,
+            _ => "",
+        }
+        .to_string(),
+    });
+    messages.push(Msg {
+        role: "system".to_string(),
+        content: "At the end of the answer add a weigth in form of W:<1-10> for how important this information is to the greater context".to_string()
+    });
+
+    messages.push(user_message);
+
+    let data_package = Obj {
+        model: "gpt-4".to_string(),
+        stream: true,
+        messages,
+    };
 
     let key = env::var("OPENAI_API_KEY")?;
 
@@ -70,6 +68,7 @@ async fn post(context: &str, message: String) -> Result<String, Box<dyn Error>> 
 
     let mut collected_message = "".to_string();
     println!();
+
     while let Some(item) = stream.next().await {
         let chunk = item.or(Err(format!("Error while downloading file")))?;
         let bytes = chunk.to_vec();
@@ -93,30 +92,49 @@ async fn post(context: &str, message: String) -> Result<String, Box<dyn Error>> 
 
                         collected_message.push_str(message.as_str());
 
-                        print!("{}", message)
+                        termimad::print_inline(message.as_str());
+                        let _result = io::stdout().flush();
                     }
                     Err(e) => println!("{:#?}, {:#?}", e, trimmed),
                 }
             }
         });
-
     }
-    //println!("collected: {}", collected_message);
-    let abriviation_message = Obj{
-       stream: false,
-        model: "gpt-3.5".to_string(),
-        messages: vec!(Msg{role: "system".to_string(), content:"Abreviate this following message to the best possble short (limited token) use, so that I can use it as a history for the context in gpt prompting".to_string()})
-    }; 
+
+    return Ok(collected_message);
+}
+
+async fn create_context(
+    question: &String,
+    message: &String,
+) -> Result<String, Box<dyn Error>> {
+    let key = env::var("OPENAI_API_KEY")?;
+    let client = Client::new();
+    let abriviation_message = Obj {
+        stream: false,
+        model: "gpt-3.5-turbo".to_string(),
+        messages: vec![
+            Msg {
+                role: "system".to_string(),
+                content: ABREVIATE.to_string(),
+            },
+            Msg {
+                role: "user".to_string(),
+                content: format!("Q:{},A:{}", question, message),
+            },
+        ],
+    };
+
     let abr_request = client
         .post("https://api.openai.com/v1/chat/completions")
         .bearer_auth(&key)
-        .json(&data_package);
+        .json(&abriviation_message);
     let abr_res = abr_request.send().await?;
-    println!("abr response: {:#?}", abr_res);
 
-    Ok(format!("res: {:#?}", data))
+    let completion: ChatCompletion = abr_res.json().await?;
+
+    return Ok(completion.choices.first().unwrap().message.content.clone());
 }
-use clap::Parser;
 
 /// Simple program to query gpt
 #[derive(Parser, Debug)]
@@ -127,12 +145,33 @@ struct Args {
     context: String,
 
     /// Number of times to greet
-    #[arg(short, long )]
+    #[arg(short, long)]
     message: String,
 }
 
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
-    let _res = post(args.context.as_str(), args.message).await;
+    let history = load_data(&args.context);
+    //println!("using history {:?}", history);
+    termimad::print_inline("prompting **gpt-4** and abreviating with **gpt-3.5-turbo**");
+    let answer = prompt(args.context.as_str(), &args.message, &history).await;
+    match answer {
+        Ok(answer_text) => {
+            append_log(&args.message, &answer_text, &args.context.to_string());
+            let abreviated_answer =
+                create_context(&args.message, &answer_text).await;
+            match abreviated_answer {
+                Ok(abreviated_text) => {
+                    append_data(abreviated_text, args.context.to_string());
+                }
+                Err(e) => {
+                    println!("Error: {}", e);
+                }
+            };
+        }
+        Err(e) => {
+            println!("Error: {}", e);
+        }
+    }
 }
